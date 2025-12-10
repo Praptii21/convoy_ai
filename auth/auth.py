@@ -1,6 +1,9 @@
 from fastapi import APIRouter, HTTPException
 from backend.db_connection import get_connection
 from backend.utils.hashing import hash_password, verify_password
+from backend.utils.auth_utils import create_access_token
+from datetime import timedelta
+
 
 router = APIRouter()
 
@@ -31,7 +34,18 @@ def register_user(data: dict):
         user_id = cur.fetchone()["user_id"]
         conn.commit()
 
-        return {"message": "Registration successful", "user_id": user_id}
+        # Create JWT token for new user
+        token = create_access_token(
+            data={"user_id": user_id, "email": email},
+            expires_delta=timedelta(days=1)
+        )
+
+        return {
+            "message": "Registration successful",
+            "user_id": user_id,
+            "access_token": token,
+            "token_type": "bearer"
+        }
 
     except Exception as e:
         conn.rollback()
@@ -48,6 +62,9 @@ def login_user(data: dict):
     email = data.get("email")
     password = data.get("password")
 
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password required")
+
     conn = get_connection()
     cur = conn.cursor()
 
@@ -63,4 +80,15 @@ def login_user(data: dict):
     if not verify_password(password, hashed_pw):
         raise HTTPException(status_code=401, detail="Incorrect password")
 
-    return {"message": "Login successful", "user_id": user_id}
+    # Generate JWT Token
+    token = create_access_token(
+        data={"user_id": user_id, "email": email},
+        expires_delta=timedelta(days=1)
+    )
+
+    return {
+        "message": "Login successful",
+        "user_id": user_id,
+        "access_token": token,
+        "token_type": "bearer"
+    }
