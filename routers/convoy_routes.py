@@ -1,9 +1,12 @@
-from fastapi import APIRouter, HTTPException, Query
+# backend/routers/convoy_routes.py
+from typing import Optional, List, Dict, Any
+from fastapi import APIRouter, HTTPException, Query, Depends
 from fastapi.responses import JSONResponse
-from backend.models.convoy import Convoy, Vehicle
+from backend.models.convoy import Convoy, Vehicle, Route
 from backend.utils.helpers import haversine_km
 from backend.db_connection import get_connection
-from backend.geocode_router import GeocodingService, geocode_place as address_to_coords, reverse_geocode_place as coords_to_address
+from backend.geocode_router import GeocodingService
+from backend.utils.auth_utils import get_current_user
 
 import requests
 import json
@@ -14,23 +17,24 @@ router = APIRouter()
 # ----------------------------
 # Create convoy + vehicles + route
 # ----------------------------
-# ----------------------------
-# Create convoy + vehicles + route
-# ----------------------------
 @router.post("/create")
-def create_convoy(convoy: Convoy):
+def create_convoy(convoy: Convoy, current_user: dict = Depends(get_current_user)):
     """
     Create a new convoy and persist vehicles and route if provided.
+    Automatically sets created_by = logged-in user_id (from JWT).
     """
+    user_id = current_user["user_id"]
+
     conn = get_connection()
     cur = conn.cursor()
 
     try:
         # Validate coordinates exist
-        if convoy.source_lat is None or convoy.source_lon is None or convoy.destination_lat is None or convoy.destination_lon is None:
+        if convoy.source_lat is None or convoy.source_lon is None \
+           or convoy.destination_lat is None or convoy.destination_lon is None:
             raise HTTPException(status_code=400, detail="Convoy must include source and destination coordinates (lat/lon).")
 
-        # Insert convoy (ensure places are included)
+        # Insert convoy (ensure places are included); store created_by = user_id
         cur.execute("""
             INSERT INTO convoys
             (convoy_name, source_place, destination_place,
@@ -46,7 +50,7 @@ def create_convoy(convoy: Convoy):
             convoy.destination_lat,
             convoy.destination_lon,
             convoy.priority.value if hasattr(convoy.priority, "value") else convoy.priority,
-            None
+            user_id
         ))
 
         row = cur.fetchone()
@@ -69,6 +73,8 @@ def create_convoy(convoy: Convoy):
                 v.driver_name,
                 v.current_status.value if hasattr(v.current_status, "value") else v.current_status
             ))
+            # optionally fetch vehicle_id if needed
+            cur.fetchone()
 
         # Insert route if present
         if getattr(convoy, "route", None):
@@ -86,6 +92,7 @@ def create_convoy(convoy: Convoy):
                 END$$;
             """)
 
+            # Insert route using server-assigned convoy_id (ignore any convoy_id inside payload)
             cur.execute("""
                 INSERT INTO routes (convoy_id, waypoints, total_distance_km, estimated_duration_minutes)
                 VALUES (%s, %s, %s, %s)
@@ -97,11 +104,35 @@ def create_convoy(convoy: Convoy):
                 getattr(convoy.route, "estimated_duration_minutes", None)
             ))
 
+            route_row = cur.fetchone()
+            if route_row:
+                route_id = route_row["route_id"]
+
+                # If you have a separate routes_waypoints table, insert individual waypoints
+                # If it doesn't exist, skip (we keep existing JSONB column too)
+                try:
+                    # check if routes_waypoints exists
+                    cur.execute("""
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_name = 'routes_waypoints' LIMIT 1;
+                    """)
+                    if cur.fetchone():
+                        # insert each waypoint into routes_waypoints with position_order
+                        for idx, wp in enumerate(convoy.route.waypoints or []):
+                            cur.execute("""
+                                INSERT INTO routes_waypoints (route_id, lat, lon, position_order)
+                                VALUES (%s, %s, %s, %s);
+                            """, (route_id, wp.get("lat"), wp.get("lon"), idx + 1))
+                except Exception:
+                    # ignore failure to insert into routes_waypoints (optional)
+                    pass
+
         conn.commit()
         return JSONResponse({
             "status": "success",
             "convoy_id": convoy_id,
-            "message": f"Convoy '{convoy.convoy_name}' created and saved."
+            "message": f"Convoy '{convoy.convoy_name}' created and saved.",
+            "created_by": user_id
         })
 
     except HTTPException:
@@ -119,19 +150,23 @@ def create_convoy(convoy: Convoy):
 # Add vehicle to existing convoy
 # ----------------------------
 @router.post("/add-vehicle/{convoy_id}")
-def add_vehicle_to_convoy(convoy_id: int, vehicle: Vehicle):
+def add_vehicle_to_convoy(convoy_id: int, vehicle: Vehicle, current_user: dict = Depends(get_current_user)):
     """
-    Add a vehicle to an existing convoy.
+    Add a vehicle to an existing convoy. Only the convoy owner may add vehicles.
     """
+    user_id = current_user["user_id"]
     conn = get_connection()
     cur = conn.cursor()
     try:
-        # Check convoy exists
-        cur.execute("SELECT convoy_id FROM convoys WHERE convoy_id=%s;", (convoy_id,))
-        if not cur.fetchone():
+        # Check convoy exists and belongs to current user
+        cur.execute("SELECT convoy_id, created_by FROM convoys WHERE convoy_id=%s;", (convoy_id,))
+        convoy_row = cur.fetchone()
+        if not convoy_row:
             raise HTTPException(status_code=404, detail="Convoy not found")
+        if convoy_row["created_by"] != user_id:
+            raise HTTPException(status_code=403, detail="Not allowed to modify this convoy")
 
-        # Check duplicate registration
+        # Check duplicate registration (within convoy)
         if getattr(vehicle, "registration_number", None):
             cur.execute("""
                 SELECT 1 FROM vehicles WHERE convoy_id=%s AND registration_number=%s LIMIT 1;
@@ -155,7 +190,7 @@ def add_vehicle_to_convoy(convoy_id: int, vehicle: Vehicle):
             vehicle.driver_name,
             vehicle.current_status.value if hasattr(vehicle.current_status, "value") else vehicle.current_status
         ))
-        
+
         row = cur.fetchone()
         vehicle_id = row["vehicle_id"]
 
@@ -174,21 +209,23 @@ def add_vehicle_to_convoy(convoy_id: int, vehicle: Vehicle):
 
 
 # ----------------------------
-# List convoys
+# List convoys (only convoys created by the logged-in user)
 # ----------------------------
 @router.get("/list")
-def list_convoys():
+def list_convoys(current_user: dict = Depends(get_current_user)):
+    user_id = current_user["user_id"]
     conn = get_connection()
     cur = conn.cursor()
     try:
         cur.execute("""
             SELECT convoy_id, convoy_name, priority, source_place, destination_place,
-                   source_lat, source_lon, destination_lat, destination_lon, created_at
+                   source_lat, source_lon, destination_lat, destination_lon, created_at, created_by
             FROM convoys
+            WHERE created_by = %s
             ORDER BY created_at DESC;
-        """)
+        """, (user_id,))
         rows = cur.fetchall()
-        
+
         convoys = []
         for rec in rows:
             # Count vehicles
@@ -200,13 +237,14 @@ def list_convoys():
                 "convoy_name": rec["convoy_name"],
                 "priority": rec["priority"],
                 "vehicle_count": vehicle_count,
-                "source": {"lat": rec["source_lat"], "lon": rec["source_lon"]},
-                "destination": {"lat": rec["destination_lat"], "lon": rec["destination_lon"]},
-                "created_at": rec["created_at"]
+                "source": {"lat": rec["source_lat"], "lon": rec["source_lon"], "place": rec["source_place"]},
+                "destination": {"lat": rec["destination_lat"], "lon": rec["destination_lon"], "place": rec["destination_place"]},
+                "created_at": rec["created_at"],
+                "created_by": rec["created_by"]
             })
-            
+
         return JSONResponse({"status": "success", "count": len(convoys), "convoys": convoys})
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -215,23 +253,27 @@ def list_convoys():
 
 
 # ----------------------------
-# Get convoy details
+# Get convoy details (only owner can view)
 # ----------------------------
 @router.get("/{convoy_id}")
-def get_convoy(convoy_id: int):
+def get_convoy(convoy_id: int, current_user: dict = Depends(get_current_user)):
+    user_id = current_user["user_id"]
     conn = get_connection()
     cur = conn.cursor()
     try:
         # Get convoy
         cur.execute("""
             SELECT convoy_id, convoy_name, priority, source_place, destination_place,
-                   source_lat, source_lon, destination_lat, destination_lon, created_at
+                   source_lat, source_lon, destination_lat, destination_lon, created_at, created_by
             FROM convoys WHERE convoy_id=%s;
         """, (convoy_id,))
-        
+
         rec = cur.fetchone()
         if not rec:
             raise HTTPException(status_code=404, detail="Convoy not found")
+
+        if rec["created_by"] != user_id:
+            raise HTTPException(status_code=403, detail="Not allowed to view this convoy")
 
         # Get vehicles
         cur.execute("""
@@ -241,12 +283,39 @@ def get_convoy(convoy_id: int):
         """, (convoy_id,))
         vehicles = cur.fetchall()
 
-        # Get route
+        # Get route (JSONB or first matching)
         cur.execute("""
-            SELECT route_id, waypoints, total_distance_km, estimated_duration_minutes 
+            SELECT route_id, waypoints, total_distance_km, estimated_duration_minutes
             FROM routes WHERE convoy_id=%s LIMIT 1;
         """, (convoy_id,))
         route = cur.fetchone()
+
+        # If routes_waypoints exists, fetch ordered waypoints
+        waypoints = None
+        try:
+            cur.execute("""
+                SELECT 1 FROM information_schema.tables WHERE table_name='routes_waypoints' LIMIT 1;
+            """)
+            if cur.fetchone() and route:
+                # fetch waypoints from routes_waypoints
+                cur.execute("""
+                    SELECT lat, lon, position_order FROM routes_waypoints
+                    WHERE route_id = %s ORDER BY position_order;
+                """, (route["route_id"],))
+                wrows = cur.fetchall()
+                waypoints = [{"lat": r["lat"], "lon": r["lon"]} for r in wrows]
+        except Exception:
+            waypoints = None
+
+        # prefer normalized waypoints if available, else use stored JSON
+        route_payload = None
+        if route:
+            route_payload = {
+                "route_id": route["route_id"],
+                "total_distance_km": route["total_distance_km"],
+                "estimated_duration_minutes": route["estimated_duration_minutes"],
+                "waypoints": waypoints if waypoints is not None else route["waypoints"]
+            }
 
         return JSONResponse({
             "status": "success",
@@ -259,11 +328,12 @@ def get_convoy(convoy_id: int):
                 "source": {"lat": rec["source_lat"], "lon": rec["source_lon"]},
                 "destination": {"lat": rec["destination_lat"], "lon": rec["destination_lon"]},
                 "vehicles": vehicles,
-                "route": route,
-                "created_at": rec["created_at"]
+                "route": route_payload,
+                "created_at": rec["created_at"],
+                "created_by": rec["created_by"]
             }
         })
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -274,24 +344,29 @@ def get_convoy(convoy_id: int):
 
 
 # ----------------------------
-# Delete convoy
+# Delete convoy (owner only)
 # ----------------------------
 @router.delete("/{convoy_id}")
-def delete_convoy(convoy_id: int):
+def delete_convoy(convoy_id: int, current_user: dict = Depends(get_current_user)):
+    user_id = current_user["user_id"]
     conn = get_connection()
     cur = conn.cursor()
     try:
-        cur.execute("SELECT convoy_name FROM convoys WHERE convoy_id=%s;", (convoy_id,))
+        cur.execute("SELECT convoy_name, created_by FROM convoys WHERE convoy_id=%s;", (convoy_id,))
         rec = cur.fetchone()
         if not rec:
             raise HTTPException(status_code=404, detail="Convoy not found")
-        
+
+        if rec["created_by"] != user_id:
+            raise HTTPException(status_code=403, detail="Not allowed to delete this convoy")
+
         conv_name = rec["convoy_name"]
+        # if you want to cascade-delete vehicles/routes/waypoints, rely on FK cascade or delete manually
         cur.execute("DELETE FROM convoys WHERE convoy_id=%s;", (convoy_id,))
         conn.commit()
-        
+
         return JSONResponse({"status": "success", "message": f"Convoy '{conv_name}' deleted."})
-        
+
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -301,7 +376,7 @@ def delete_convoy(convoy_id: int):
 
 
 # ----------------------------
-# Suggest merge
+# Suggest merge (public — does not require owner)
 # ----------------------------
 @router.post("/suggest_merge")
 def suggest_merge(convoy_a: Convoy, convoy_b: Convoy, max_extra_minutes: float = 30.0,
@@ -437,7 +512,7 @@ def geocode_address(address: str = Query(..., description="Address to convert to
     """
     try:
         result = GeocodingService.geocode(address)
-        
+
         if result:
             return JSONResponse({
                 "status": "success",
@@ -454,7 +529,7 @@ def geocode_address(address: str = Query(..., description="Address to convert to
                 "status": "not_found",
                 "message": f"Could not find coordinates for address: {address}"
             }, status_code=404)
-            
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -473,7 +548,7 @@ def reverse_geocode_coords(
     """
     try:
         result = GeocodingService.reverse_geocode(lat, lon)
-        
+
         if result:
             return JSONResponse({
                 "status": "success",
@@ -492,7 +567,7 @@ def reverse_geocode_coords(
                 "status": "not_found",
                 "message": f"Could not find address for coordinates: {lat}, {lon}"
             }, status_code=404)
-            
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -501,17 +576,17 @@ def reverse_geocode_coords(
 # Batch Geocoding: Convert multiple addresses
 # ----------------------------
 @router.post("/batch-geocode")
-def batch_geocode(addresses: list[str]):
+def batch_geocode(addresses: List[str]):
     """
     Geocode multiple addresses at once
     Send JSON body: ["Mumbai, India", "Delhi, India", "Pune, India"]
     """
     try:
         results = GeocodingService.batch_geocode(addresses)
-        
+
         geocoded = []
         failed = []
-        
+
         for i, result in enumerate(results):
             if result:
                 geocoded.append({
@@ -522,7 +597,7 @@ def batch_geocode(addresses: list[str]):
                 })
             else:
                 failed.append(addresses[i])
-        
+
         return JSONResponse({
             "status": "success",
             "total": len(addresses),
@@ -531,7 +606,7 @@ def batch_geocode(addresses: list[str]):
             "results": geocoded,
             "failed_addresses": failed
         })
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -545,27 +620,30 @@ def create_convoy_from_address(
     source_address: str,
     destination_address: str,
     priority: str = "medium",
-    vehicles: list = []
+    vehicles: List[Dict[str, Any]] = [],
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Create a convoy using addresses instead of coordinates
     Automatically geocodes addresses to coordinates
     """
+    user_id = current_user["user_id"]
+
     try:
         # Geocode source address
         source_result = GeocodingService.geocode(source_address)
         if not source_result:
             raise HTTPException(status_code=400, detail=f"Could not geocode source address: {source_address}")
-        
+
         # Geocode destination address
         dest_result = GeocodingService.geocode(destination_address)
         if not dest_result:
             raise HTTPException(status_code=400, detail=f"Could not geocode destination address: {destination_address}")
-        
+
         # Create convoy in database
         conn = get_connection()
         cur = conn.cursor()
-        
+
         cur.execute("""
             INSERT INTO convoys
             (convoy_name, source_place, destination_place,
@@ -581,16 +659,33 @@ def create_convoy_from_address(
             dest_result["lat"],
             dest_result["lon"],
             priority,
-            None
+            user_id
         ))
-        
+
         row = cur.fetchone()
         convoy_id = row["convoy_id"]
-        
+
+        # Insert vehicles if provided (vehicles passed as list of dicts)
+        for v in vehicles or []:
+            cur.execute("""
+                INSERT INTO vehicles
+                (convoy_id, vehicle_type, registration_number, load_type, load_weight_kg, capacity_kg, driver_name, current_status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+            """, (
+                convoy_id,
+                v.get("vehicle_type"),
+                v.get("registration_number"),
+                v.get("load_type"),
+                v.get("load_weight_kg"),
+                v.get("capacity_kg"),
+                v.get("driver_name"),
+                v.get("current_status", "pending")
+            ))
+
         conn.commit()
         cur.close()
         conn.close()
-        
+
         return JSONResponse({
             "status": "success",
             "convoy_id": convoy_id,
@@ -602,9 +697,10 @@ def create_convoy_from_address(
             "destination": {
                 "address": destination_address,
                 "coordinates": {"lat": dest_result["lat"], "lon": dest_result["lon"]}
-            }
+            },
+            "created_by": user_id
         })
-        
+
     except HTTPException:
         raise
     except Exception as e:
