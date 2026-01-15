@@ -17,3 +17,4 @@ def get_connection():
     except Exception as e:
         print(f"FAILURE! Connection failed with error: {e}")
         return None
+
